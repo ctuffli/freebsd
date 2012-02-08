@@ -308,7 +308,7 @@ xpt_schedule_dev_allocq(struct cam_eb *bus, struct cam_ed *dev)
 		CAMQ_GET_PRIO(&dev->drvq))) == 0)) {
 		/*
 		 * The priority of a device waiting for CCB resources
-		 * is that of the the highest priority peripheral driver
+		 * is that of the highest priority peripheral driver
 		 * enqueued.
 		 */
 		retval = xpt_schedule_dev(&bus->sim->devq->alloc_queue,
@@ -331,7 +331,7 @@ xpt_schedule_dev_sendq(struct cam_eb *bus, struct cam_ed *dev)
 	    (cam_ccbq_frozen_top(&dev->ccbq) == 0)) {
 		/*
 		 * The priority of a device waiting for controller
-		 * resources is that of the the highest priority CCB
+		 * resources is that of the highest priority CCB
 		 * enqueued.
 		 */
 		retval =
@@ -3262,8 +3262,10 @@ xpt_create_path_unlocked(struct cam_path **new_path_ptr,
 		}
 	}
 	status = xpt_compile_path(path, periph, path_id, target_id, lun_id);
-	if (need_unlock)
+	if (need_unlock) {
 		CAM_SIM_UNLOCK(bus->sim);
+		xpt_release_bus(bus);
+	}
 	if (status != CAM_REQ_CMP) {
 		free(path, M_CAMXPT);
 		path = NULL;
@@ -4157,15 +4159,17 @@ static void
 xpt_release_bus(struct cam_eb *bus)
 {
 
+	mtx_lock(&xsoftc.xpt_topo_lock);
+	KASSERT(bus->refcount >= 1, ("bus->refcount >= 1"));
 	if ((--bus->refcount == 0)
 	 && (TAILQ_FIRST(&bus->et_entries) == NULL)) {
-		mtx_lock(&xsoftc.xpt_topo_lock);
 		TAILQ_REMOVE(&xsoftc.xpt_busses, bus, links);
 		xsoftc.bus_generation++;
 		mtx_unlock(&xsoftc.xpt_topo_lock);
 		cam_sim_release(bus->sim);
 		free(bus, M_CAMXPT);
-	}
+	} else
+		mtx_unlock(&xsoftc.xpt_topo_lock);
 }
 
 static struct cam_et *
@@ -4208,13 +4212,15 @@ static void
 xpt_release_target(struct cam_et *target)
 {
 
-	if ((--target->refcount == 0)
-	 && (TAILQ_FIRST(&target->ed_entries) == NULL)) {
-		TAILQ_REMOVE(&target->bus->et_entries, target, links);
-		target->bus->generation++;
-		xpt_release_bus(target->bus);
-		free(target, M_CAMXPT);
-	}
+	if (target->refcount == 1) {
+		if (TAILQ_FIRST(&target->ed_entries) == NULL) {
+			TAILQ_REMOVE(&target->bus->et_entries, target, links);
+			target->bus->generation++;
+			xpt_release_bus(target->bus);
+			free(target, M_CAMXPT);
+		}
+	} else
+		target->refcount--;
 }
 
 static struct cam_ed *
@@ -4311,7 +4317,7 @@ void
 xpt_release_device(struct cam_ed *device)
 {
 
-	if (--device->refcount == 0) {
+	if (device->refcount == 1) {
 		struct cam_devq *devq;
 
 		if (device->alloc_ccb_entry.pinfo.index != CAM_UNQUEUED_INDEX
@@ -4319,7 +4325,7 @@ xpt_release_device(struct cam_ed *device)
 			panic("Removing device while still queued for ccbs");
 
 		if ((device->flags & CAM_DEV_REL_TIMEOUT_PENDING) != 0)
-				callout_stop(&device->callout);
+			callout_stop(&device->callout);
 
 		TAILQ_REMOVE(&device->target->ed_entries, device,links);
 		device->target->generation++;
@@ -4331,7 +4337,8 @@ xpt_release_device(struct cam_ed *device)
 		cam_ccbq_fini(&device->ccbq);
 		xpt_release_target(device->target);
 		free(device, M_CAMXPT);
-	}
+	} else
+		device->refcount--;
 }
 
 u_int32_t
